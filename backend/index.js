@@ -6,19 +6,18 @@ const app = express()
 const server = http.createServer(app)
 const io = new Server(server, {
     cors: {
-         origin: "https://guesstrap.netlify.app"
+        origin: "https://guesstrap.netlify.app"
     },
 })
 const port = process.env.PORT || 3000
 
-const ROUND_DURATION_MS = 60 * 1000 // 60 seconds per round
+const ROUND_DURATION_MS = 60 * 1000
 
 app.get('/', (req, res) => {
     res.send("Hello")
 })
 
-// ---- Room storage ----
-const rooms = new Map() // roomCode -> gameState
+const rooms = new Map()
 
 function createEmptyGameState() {
     return {
@@ -28,8 +27,9 @@ function createEmptyGameState() {
         pickerIndex: 0,
         range: { min: 1, max: 30 },
         secretNumber: null,
+        pickerCanGuess: false,
         guessLog: [],
-        scores: {},              // playerId -> { name, score }
+        scores: {},
         roundStartedAt: null,
         roundEndsAt: null,
         timeoutHandle: null,
@@ -106,6 +106,7 @@ function broadcastStatus(roomCode) {
         participants: gameState.participants.map(p => ({ id: p.id, name: p.name })),
         pickerId: picker ? picker.id : null,
         pickerName: picker ? picker.name : null,
+        pickerCanGuess: gameState.pickerCanGuess,
         scoreboard: getScoreboard(gameState),
         roundEndsAt: gameState.roundEndsAt,
     })
@@ -114,7 +115,6 @@ function broadcastStatus(roomCode) {
 io.on("connection", (socket) => {
     console.log("A player connected:", socket.id)
 
-    // ---- Create a new room ----
     socket.on("create-room", ({ mode, range, name }) => {
         const roomCode = generateRoomCode()
         const gameState = createEmptyGameState()
@@ -132,12 +132,12 @@ io.on("connection", (socket) => {
             gameState.phase = "playing"
             startRoundTimer(roomCode)
         }
+        // vs-player stays "waiting" — needs a 2nd participant before setup can begin
 
         socket.emit("room-created", { roomCode })
         broadcastStatus(roomCode)
     })
 
-    // ---- Join an existing room ----
     socket.on("join-room", ({ roomCode, name }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState) {
@@ -158,10 +158,10 @@ io.on("connection", (socket) => {
         broadcastStatus(roomCode)
     })
 
-    // ---- Current picker sets the range ----
     socket.on("set-range", ({ roomCode, min, max }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState || gameState.mode !== "vs-player") return
+        if (gameState.participants.length < 2) return // need a guesser present
         const picker = currentPicker(gameState)
         if (!picker || socket.id !== picker.id) return
 
@@ -169,39 +169,40 @@ io.on("connection", (socket) => {
         io.to(roomCode).emit("range-updated", gameState.range)
     })
 
-    // ---- Current picker sets the secret number manually ----
     socket.on("pick-number", ({ roomCode, number }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState || gameState.mode !== "vs-player") return
+        if (gameState.participants.length < 2) return
         const picker = currentPicker(gameState)
         if (!picker || socket.id !== picker.id) return
 
         gameState.secretNumber = number
         gameState.phase = "playing"
         gameState.guessLog = []
+        gameState.pickerCanGuess = false // manual pick — picker already knows it, can't guess
 
         socket.emit("number-confirmed", { number })
         startRoundTimer(roomCode)
         broadcastStatus(roomCode)
     })
 
-    // ---- Current picker randomizes the number ----
     socket.on("randomize-number", ({ roomCode }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState || gameState.mode !== "vs-player") return
+        if (gameState.participants.length < 2) return
         const picker = currentPicker(gameState)
         if (!picker || socket.id !== picker.id) return
 
         gameState.secretNumber = generateSecretNumber(gameState)
         gameState.phase = "playing"
         gameState.guessLog = []
+        gameState.pickerCanGuess = true // server picked it — picker can join in and guess too
 
         socket.emit("number-confirmed", { number: gameState.secretNumber })
         startRoundTimer(roomCode)
         broadcastStatus(roomCode)
     })
 
-    // ---- Make a guess ----
     socket.on("make-guess", ({ roomCode, guess }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState) return
@@ -210,7 +211,8 @@ io.on("connection", (socket) => {
         if (!guesser) return
 
         const picker = currentPicker(gameState)
-        if (picker && socket.id === picker.id) return
+        const isPickerSocket = picker && socket.id === picker.id
+        if (isPickerSocket && !gameState.pickerCanGuess) return // picker locked out unless they randomized
 
         if (gameState.phase !== "playing") return
 
@@ -237,10 +239,7 @@ io.on("connection", (socket) => {
                 : 0
             const guessCount = gameState.guessLog.length
 
-            pointsEarned = Math.max(
-                10,
-                100 - (guessCount - 1) * 5 - elapsedSeconds * 2
-            )
+            pointsEarned = Math.max(10, 100 - (guessCount - 1) * 5 - elapsedSeconds * 2)
 
             ensureScoreEntry(gameState, guesser)
             gameState.scores[socket.id].score += pointsEarned
@@ -261,12 +260,12 @@ io.on("connection", (socket) => {
         }
     })
 
-    // ---- Play again — rotates picker in vs-player mode ----
     socket.on("play-again", ({ roomCode }) => {
         const gameState = rooms.get(roomCode)
         if (!gameState) return
 
         gameState.guessLog = []
+        gameState.pickerCanGuess = false
         clearRoundTimer(gameState)
 
         if (gameState.mode === "vs-computer") {
@@ -276,7 +275,7 @@ io.on("connection", (socket) => {
         } else {
             gameState.pickerIndex = (gameState.pickerIndex + 1) % gameState.participants.length
             gameState.secretNumber = null
-            gameState.phase = "range-set"
+            gameState.phase = gameState.participants.length >= 2 ? "range-set" : "waiting"
         }
 
         broadcastStatus(roomCode)
@@ -305,10 +304,16 @@ io.on("connection", (socket) => {
 
         if (gameState.participants.length < minPlayers) {
             clearRoundTimer(gameState)
-            rooms.delete(roomCode)
-            io.to(roomCode).emit("game-status", { phase: "waiting", reset: true })
+            if (gameState.participants.length === 0) {
+                rooms.delete(roomCode)
+                io.to(roomCode).emit("game-status", { phase: "waiting", reset: true })
+            } else {
+                gameState.phase = "waiting"
+                gameState.secretNumber = null
+                broadcastStatus(roomCode)
+            }
         } else {
-            if (gameState.mode === "vs-player" && gameState.phase !== "waiting") {
+            if (gameState.mode === "vs-player" && gameState.phase === "playing") {
                 gameState.phase = "waiting"
                 gameState.secretNumber = null
                 clearRoundTimer(gameState)
