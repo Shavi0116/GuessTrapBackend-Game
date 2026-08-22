@@ -99,6 +99,7 @@ function broadcastStatus(roomCode) {
     const gameState = rooms.get(roomCode)
     if (!gameState) return
     const picker = currentPicker(gameState)
+    console.log(`📡 broadcastStatus for ${roomCode} — range:`, gameState.range, "phase:", gameState.phase)
     io.to(roomCode).emit("game-status", {
         phase: gameState.phase,
         mode: gameState.mode,
@@ -132,7 +133,6 @@ io.on("connection", (socket) => {
             gameState.phase = "playing"
             startRoundTimer(roomCode)
         }
-        // vs-player stays "waiting" — needs a 2nd participant before setup can begin
 
         socket.emit("room-created", { roomCode })
         broadcastStatus(roomCode)
@@ -159,13 +159,24 @@ io.on("connection", (socket) => {
     })
 
     socket.on("set-range", ({ roomCode, min, max }) => {
+        console.log(`🎯 set-range received for ${roomCode}:`, min, max, "from socket", socket.id)
         const gameState = rooms.get(roomCode)
-        if (!gameState || gameState.mode !== "vs-player") return
-        if (gameState.participants.length < 2) return // need a guesser present
+        if (!gameState || gameState.mode !== "vs-player") {
+            console.log("❌ set-range rejected: no gameState or wrong mode")
+            return
+        }
+        if (gameState.participants.length < 2) {
+            console.log("❌ set-range rejected: fewer than 2 participants")
+            return
+        }
         const picker = currentPicker(gameState)
-        if (!picker || socket.id !== picker.id) return
+        if (!picker || socket.id !== picker.id) {
+            console.log("❌ set-range rejected: sender is not the current picker")
+            return
+        }
 
         gameState.range = { min, max }
+        console.log(`✅ range updated to`, gameState.range, `— broadcasting to room ${roomCode}`)
         io.to(roomCode).emit("range-updated", gameState.range)
     })
 
@@ -179,7 +190,7 @@ io.on("connection", (socket) => {
         gameState.secretNumber = number
         gameState.phase = "playing"
         gameState.guessLog = []
-        gameState.pickerCanGuess = false // manual pick — picker already knows it, can't guess
+        gameState.pickerCanGuess = false
 
         socket.emit("number-confirmed", { number })
         startRoundTimer(roomCode)
@@ -196,7 +207,7 @@ io.on("connection", (socket) => {
         gameState.secretNumber = generateSecretNumber(gameState)
         gameState.phase = "playing"
         gameState.guessLog = []
-        gameState.pickerCanGuess = true // server picked it — picker can join in and guess too
+        gameState.pickerCanGuess = true
 
         socket.emit("number-confirmed", { number: gameState.secretNumber })
         startRoundTimer(roomCode)
@@ -212,7 +223,7 @@ io.on("connection", (socket) => {
 
         const picker = currentPicker(gameState)
         const isPickerSocket = picker && socket.id === picker.id
-        if (isPickerSocket && !gameState.pickerCanGuess) return // picker locked out unless they randomized
+        if (isPickerSocket && !gameState.pickerCanGuess) return
 
         if (gameState.phase !== "playing") return
 
